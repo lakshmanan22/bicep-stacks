@@ -16,13 +16,13 @@ on:
         type: choice
         options: [plan, apply]
       actionOnUnmanage:
-        description: "Terraform-like lifecycle: deleteResources recommended"
+        description: "Lifecycle control"
         required: true
         default: "deleteResources"
         type: choice
         options: [deleteResources, detachAll, deleteAll]
       denySettingsMode:
-        description: "Optional guardrail against portal drift"
+        description: "Guardrails against portal drift"
         required: true
         default: "none"
         type: choice
@@ -48,255 +48,262 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Setup Azure CLI + Bicep
+        shell: pwsh
         run: |
           az version
-          az bicep version || true
+          az bicep version 2>$null
           az bicep upgrade
           az bicep version
 
-      - name: Resolve stack variables (env mapping)
+      - name: Resolve variables
         id: vars
+        shell: pwsh
         run: |
-          set -e
-          ENV="${{ inputs.environment }}"
+          $envName = "${{ inputs.environment }}"
 
-          # Adjust these mappings if your test/prod RGs differ
-          RG="bicep-stacks"
-          LOC="southcentralus"
+          # Change these if your RG differs per env
+          $RG  = "rg-Automation"
+          $LOC = "southcentralus"
 
-          STACK_NAME="stk-automation-storage-${ENV}"
+          # Stack name convention (enterprise-ready)
+          $STACK = "stk-automation-storage-$envName"
 
-          # Use your current paths; move to infra/stacks/storage later if you adopt repo structure
-          BICEP_FILE="infra/main.bicep"
-          PARAMS_FILE="infra/params/${ENV}.parameter.json"
+          # Your current paths
+          $BICEP  = "infra/main.bicep"
+          $PARAMS = "infra/params/$envName.parameter.json"
 
-          echo "RG=$RG" >> $GITHUB_OUTPUT
-          echo "LOC=$LOC" >> $GITHUB_OUTPUT
-          echo "STACK_NAME=$STACK_NAME" >> $GITHUB_OUTPUT
-          echo "BICEP_FILE=$BICEP_FILE" >> $GITHUB_OUTPUT
-          echo "PARAMS_FILE=$PARAMS_FILE" >> $GITHUB_OUTPUT
+          "RG=$RG"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "LOC=$LOC"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "STACK_NAME=$STACK" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "BICEP_FILE=$BICEP"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "PARAMS_FILE=$PARAMS"| Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Plan (stack-aware drift report, single file)
+      - name: Plan (stack-aware drift report, single file) - PowerShell
+        shell: pwsh
         env:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
-          set -e
+          $ErrorActionPreference = "Stop"
 
-          RG="${{ steps.vars.outputs.RG }}"
-          LOC="${{ steps.vars.outputs.LOC }}"
-          STACK_NAME="${{ steps.vars.outputs.STACK_NAME }}"
-          BICEP_FILE="${{ steps.vars.outputs.BICEP_FILE }}"
-          PARAMS_FILE="${{ steps.vars.outputs.PARAMS_FILE }}"
-          AOU="${{ inputs.actionOnUnmanage }}"
+          $RG         = "${{ steps.vars.outputs.RG }}"
+          $LOC        = "${{ steps.vars.outputs.LOC }}"
+          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
+          $BICEP_FILE = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_FILE= "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $AOU        = "${{ inputs.actionOnUnmanage }}"
+          $RUN_ID     = "${{ github.run_id }}"
 
           # Ensure RG exists
-          az group create -n "$RG" -l "$LOC" --only-show-errors >/dev/null
+          az group create -n $RG -l $LOC --only-show-errors | Out-Null
 
-          # 1) Run classic what-if (good for create/modify signals)
-          az deployment group what-if \
-            --resource-group "$RG" \
-            --name "whatif-${{ github.run_id }}" \
-            --template-file "$BICEP_FILE" \
-            --parameters @"$GITHUB_WORKSPACE/$PARAMS_FILE" \
-            --only-show-errors \
-            > /tmp/whatif.txt 2>&1
+          # 1) What-If text output (reliable)
+          $whatIfPath = "/tmp/whatif.txt"
+          $whatIfOut = az deployment group what-if `
+            --resource-group $RG `
+            --name "whatif-$RUN_ID" `
+            --template-file $BICEP_FILE `
+            --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" `
+            --only-show-errors 2>&1
 
-          # 2) Compile bicep -> ARM JSON (so we can list desired resource IDs)
-          az bicep build --file "$BICEP_FILE" --outfile /tmp/template.json
+          $whatIfOut | Out-File -FilePath $whatIfPath -Encoding utf8
 
-          # 3) Get stack-managed resources (if stack exists)
-          #    If the stack doesn't exist yet, this will fail; we treat it as empty.
-          az stack group show -g "$RG" -n "$STACK_NAME" -o json --only-show-errors > /tmp/stack.json 2>/tmp/stack.err || echo "{}" > /tmp/stack.json
+          # 2) Compile Bicep to ARM JSON
+          $templatePath = "/tmp/template.json"
+          az bicep build --file $BICEP_FILE --outfile $templatePath | Out-Null
+          $template = Get-Content $templatePath -Raw | ConvertFrom-Json
 
-          # 4) Create ONE terraform-like report (adds/changes from what-if + destroys from stack ownership diff)
-          python3 - <<'PY'
-          import json, re, sys
-          from pathlib import Path
+          # 3) Load params
+          $params = Get-Content $PARAMS_FILE -Raw | ConvertFrom-Json
+          $paramValues = @{}
+          foreach ($k in $params.parameters.PSObject.Properties.Name) {
+            $paramValues[$k] = $params.parameters.$k.value
+          }
 
-          rg = "${{ steps.vars.outputs.RG }}"
-          stack_name = "${{ steps.vars.outputs.STACK_NAME }}"
-          aou = "${{ inputs.actionOnUnmanage }}"
-          bicep_file = "${{ steps.vars.outputs.BICEP_FILE }}"
-          params_file = "${{ steps.vars.outputs.PARAMS_FILE }}"
-          run_id = "${{ github.run_id }}"
+          # 4) Load stack (if exists)
+          $stackObj = $null
+          $stackJson = az stack group show -g $RG -n $STACK_NAME -o json --only-show-errors 2>$null
+          if ($LASTEXITCODE -eq 0 -and $stackJson) {
+            $stackObj = $stackJson | ConvertFrom-Json
+          } else {
+            $stackObj = @{}  # treat as empty
+          }
 
-          whatif_txt = Path("/tmp/whatif.txt").read_text(errors="ignore")
-          template = json.loads(Path("/tmp/template.json").read_text(errors="ignore"))
-          try:
-            stack = json.loads(Path("/tmp/stack.json").read_text(errors="ignore"))
-          except Exception:
-            stack = {}
+          function Find-SubscriptionId($obj) {
+            if ($null -eq $obj) { return $null }
+            if ($obj -is [string]) {
+              if ($obj -match "/subscriptions/([^/]+)/") { return $Matches[1] }
+              return $null
+            }
+            if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string])) {
+              foreach ($i in $obj) {
+                $r = Find-SubscriptionId $i
+                if ($r) { return $r }
+              }
+            }
+            if ($obj.PSObject -and $obj.PSObject.Properties) {
+              foreach ($p in $obj.PSObject.Properties) {
+                $r = Find-SubscriptionId $p.Value
+                if ($r) { return $r }
+              }
+            }
+            return $null
+          }
 
-          # ---- Parse create/modify from what-if TEXT (skip legend lines by requiring Microsoft.)
-          add_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  \+ Microsoft\.", l)]
-          mod_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  ~ Microsoft\.", l)]
-          del_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  - Microsoft\.", l)]
+          function Collect-ResourceIds($obj, [ref]$set) {
+            if ($null -eq $obj) { return }
+            if ($obj -is [string]) {
+              if ($obj.StartsWith("/subscriptions/") -and $obj -match "/providers/") {
+                $set.Value.Add($obj) | Out-Null
+              }
+              return
+            }
+            if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string])) {
+              foreach ($i in $obj) { Collect-ResourceIds $i ([ref]$set.Value) }
+            }
+            if ($obj.PSObject -and $obj.PSObject.Properties) {
+              foreach ($p in $obj.PSObject.Properties) { Collect-ResourceIds $p.Value ([ref]$set.Value) }
+            }
+          }
 
-          # Extract the full blocks for +/~/- resources (resource line + indented property lines)
-          def blocks(symbol_regex):
-            out = []
-            lines = whatif_txt.splitlines()
-            i = 0
-            while i < len(lines):
-              if re.match(symbol_regex, lines[i]):
-                blk = [lines[i]]
-                i += 1
-                while i < len(lines) and lines[i].startswith("    "):
-                  blk.append(lines[i])
-                  i += 1
-                out.append("\n".join(blk))
-              else:
-                i += 1
-            return out
+          # Parse What-If into blocks (+/~/- only real resource lines)
+          $lines = Get-Content $whatIfPath
 
-          add_blocks = blocks(r"^  \+ Microsoft\.")
-          mod_blocks = blocks(r"^  ~ Microsoft\.")
-          del_blocks = blocks(r"^  - Microsoft\.")
+          function Get-Blocks($lines, $symbol) {
+            $rx = "^\s{2}\$symbol\sMicrosoft\."
+            $blocks = @()
+            for ($i=0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match $rx) {
+                $blk = @($lines[$i])
+                $j = $i + 1
+                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) {
+                  $blk += $lines[$j]
+                  $j++
+                }
+                $blocks += ($blk -join "`n")
+                $i = $j - 1
+              }
+            }
+            return $blocks
+          }
 
-          # ---- Build "desired resource IDs" from compiled template (best-effort)
-          # Handles resource name like "[parameters('storageAccountName')]" by reading params file.
-          params = json.loads(Path(params_file).read_text(errors="ignore"))
-          param_values = {k: v.get("value") for k, v in params.get("parameters", {}).items()}
+          $addBlocks = Get-Blocks $lines "+"
+          $modBlocks = Get-Blocks $lines "~"
+          $delBlocks = Get-Blocks $lines "-"
 
-          sub_id = None
-          # We'll infer subscription id from stack show if present, else leave unknown and skip stack diff.
-          # In real runs, stack.json contains resource IDs we can mine.
-          def find_sub_id(obj):
-            if isinstance(obj, dict):
-              for v in obj.values():
-                r = find_sub_id(v)
-                if r: return r
-            elif isinstance(obj, list):
-              for v in obj:
-                r = find_sub_id(v)
-                if r: return r
-            elif isinstance(obj, str) and "/subscriptions/" in obj:
-              m = re.search(r"/subscriptions/([^/]+)/", obj)
-              if m: return m.group(1)
-            return None
+          # Counts (do NOT count legend lines)
+          $adds    = $addBlocks.Count
+          $changes = $modBlocks.Count
+          $deletesFromWhatIf = $delBlocks.Count
 
-          sub_id = find_sub_id(stack) or "UNKNOWN"
+          # Stack-aware destroys (managed by stack but missing from template)
+          $subId = Find-SubscriptionId $stackObj
+          $desiredIds = New-Object System.Collections.Generic.HashSet[string]
 
-          desired_ids = set()
-          for r in template.get("resources", []):
-            rtype = r.get("type")
-            rname = r.get("name")
-            if not rtype or not rname:
-              continue
+          if ($subId) {
+            foreach ($r in ($template.resources | ForEach-Object { $_ })) {
+              $rtype = $r.type
+              $rname = $r.name
+              if (-not $rtype -or -not $rname) { continue }
 
-            # Resolve simple parameter expressions
-            if isinstance(rname, str):
-              m = re.fullmatch(r"\[parameters\('([^']+)'\)\]", rname)
-              if m and m.group(1) in param_values:
-                rname = param_values[m.group(1)]
+              # Resolve: [parameters('x')]
+              if ($rname -is [string] -and $rname -match "^\[parameters\('([^']+)'\)\]$") {
+                $pname = $Matches[1]
+                if ($paramValues.ContainsKey($pname)) { $rname = $paramValues[$pname] }
+              }
 
-            # Only accept fully resolved string names
-            if not isinstance(rname, str) or "[" in rname or "]" in rname:
-              continue
+              if ($rname -isnot [string]) { continue }
+              if ($rname.Contains("[") -or $rname.Contains("]")) { continue } # unresolved expression
 
-            if sub_id != "UNKNOWN":
-              rid = f"/subscriptions/{sub_id}/resourceGroups/{rg}/providers/{rtype}/{rname}"
-              desired_ids.add(rid)
+              $rid = "/subscriptions/$subId/resourceGroups/$RG/providers/$rtype/$rname"
+              $desiredIds.Add($rid) | Out-Null
+            }
+          }
 
-          # ---- Get stack-managed IDs
-          # Quickstart output includes managed resources in the stack show payload. We'll conservatively
-          # collect any strings that look like resource IDs.
-          managed_ids = set()
+          $managedIds = New-Object System.Collections.Generic.HashSet[string]
+          Collect-ResourceIds $stackObj ([ref]$managedIds)
 
-          def collect_ids(obj):
-            if isinstance(obj, dict):
-              for v in obj.values():
-                collect_ids(v)
-            elif isinstance(obj, list):
-              for v in obj:
-                collect_ids(v)
-            elif isinstance(obj, str) and obj.startswith("/subscriptions/") and "/providers/" in obj:
-              managed_ids.add(obj)
+          $stackDestroyIds = @()
+          if (($AOU -eq "deleteResources" -or $AOU -eq "deleteAll") -and $subId -and $desiredIds.Count -gt 0) {
+            $stackDestroyIds = $managedIds.Where({ -not $desiredIds.Contains($_) }) | Sort-Object
+          }
 
-          collect_ids(stack)
+          $destroys = $deletesFromWhatIf + $stackDestroyIds.Count
 
-          # Stack-aware destroys: resources managed by the stack but not in desired template
-          # Only meaningful when actionOnUnmanage implies deletion.
-          stack_destroy_ids = []
-          if aou in ("deleteResources", "deleteAll") and sub_id != "UNKNOWN" and desired_ids:
-            stack_destroy_ids = sorted(list(managed_ids - desired_ids))
+          # Build single report
+          $report = New-Object System.Collections.Generic.List[string]
+          $report.Add("Terraform-style Drift Report (Deployment Stack)")
+          $report.Add("==============================================")
+          $report.Add("Stack Name    : $STACK_NAME")
+          $report.Add("Resource Group: $RG")
+          $report.Add("Bicep File    : $BICEP_FILE")
+          $report.Add("Params File   : $PARAMS_FILE")
+          $report.Add("Run ID        : $RUN_ID")
+          $report.Add("")
+          $report.Add("Plan: $adds to add, $changes to change, $destroys to destroy")
+          $report.Add("")
 
-          # Plan counts
-          adds = len(add_lines)
-          changes = len(mod_lines)
-          destroys = len(del_lines) + len(stack_destroy_ids)
+          if ($adds -gt 0) {
+            $report.Add("+ Create")
+            $report.Add("--------")
+            $addBlocks | ForEach-Object { $report.Add($_) }
+            $report.Add("")
+          }
 
-          report = []
-          report.append("Terraform-style Drift Report (Deployment Stack)")
-          report.append("==============================================")
-          report.append(f"Stack Name    : {stack_name}")
-          report.append(f"Resource Group: {rg}")
-          report.append(f"Bicep File    : {bicep_file}")
-          report.append(f"Params File   : {params_file}")
-          report.append(f"Run ID        : {run_id}")
-          report.append("")
-          report.append(f"Plan: {adds} to add, {changes} to change, {destroys} to destroy")
-          report.append("")
+          if ($changes -gt 0) {
+            $report.Add("~ Modify")
+            $report.Add("--------")
+            $modBlocks | ForEach-Object { $report.Add($_) }
+            $report.Add("")
+          }
 
-          if adds:
-            report.append("+ Create")
-            report.append("--------")
-            report.extend(add_blocks)
-            report.append("")
+          if ($destroys -gt 0) {
+            $report.Add("- Destroy")
+            $report.Add("---------")
+            $delBlocks | ForEach-Object { $report.Add($_) }
 
-          if changes:
-            report.append("~ Modify")
-            report.append("--------")
-            report.extend(mod_blocks)
-            report.append("")
+            if ($stackDestroyIds.Count -gt 0) {
+              $report.Add("")
+              $report.Add("Stack-managed resources removed from template (will be deleted on apply)")
+              $report.Add("-----------------------------------------------------------------------")
+              $stackDestroyIds | ForEach-Object { $report.Add("- $_") }
+              $report.Add("")
+            }
+          }
 
-          if destroys:
-            report.append("- Destroy")
-            report.append("---------")
-            # Deletes directly reported by what-if
-            report.extend(del_blocks)
+          if ($adds -eq 0 -and $changes -eq 0 -and $destroys -eq 0) {
+            $report.Add("No changes detected.")
+          }
 
-            # Stack-based deletes (resources removed from template but still managed by stack)
-            if stack_destroy_ids:
-              report.append("")
-              report.append("Stack-managed resources removed from template (will be deleted on apply)")
-              report.append("-----------------------------------------------------------------------")
-              for rid in stack_destroy_ids:
-                report.append(f"- {rid}")
-            report.append("")
-
-          # If none
-          if not (adds or changes or destroys):
-            report.append("No changes detected.")
-
-          Path("drift-report.txt").write_text("\n".join(report))
-          PY
-
-          ls -l drift-report.txt
+          $reportPath = "drift-report.txt"
+          $report -join "`n" | Out-File -FilePath $reportPath -Encoding utf8
+          Get-Item $reportPath | Format-List | Out-Host
 
       - name: Apply stack (only when operation=apply)
         if: ${{ inputs.operation == 'apply' }}
+        shell: pwsh
         env:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
-          set -e
-          RG="${{ steps.vars.outputs.RG }}"
-          STACK_NAME="${{ steps.vars.outputs.STACK_NAME }}"
-          BICEP_FILE="${{ steps.vars.outputs.BICEP_FILE }}"
-          PARAMS_FILE="${{ steps.vars.outputs.PARAMS_FILE }}"
+          $ErrorActionPreference = "Stop"
 
-          # Create or update the stack (Terraform-like lifecycle)
-          # --action-on-unmanage controls delete vs detach behavior
-          # --deny-settings-mode controls guardrails against portal edits
-          az stack group create \
-            --name "$STACK_NAME" \
-            --resource-group "$RG" \
-            --template-file "$BICEP_FILE" \
-            --parameters @"$GITHUB_WORKSPACE/$PARAMS_FILE" \
-            --action-on-unmanage "${{ inputs.actionOnUnmanage }}" \
-            --deny-settings-mode "${{ inputs.denySettingsMode }}" \
-            --yes \
-            --only-show-errors
+          $RG         = "${{ steps.vars.outputs.RG }}"
+          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
+          $BICEP_FILE = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_FILE= "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $AOU        = "${{ inputs.actionOnUnmanage }}"
+          $DSM        = "${{ inputs.denySettingsMode }}"
+
+          # Create/update deployment stack (Terraform-like lifecycle control)
+          # action-on-unmanage and deny-settings-mode options are documented in az stack group create. [1](https://learn.microsoft.com/en-us/cli/azure/stack/group?view=azure-cli-latest)
+          az stack group create `
+            --name $STACK_NAME `
+            --resource-group $RG `
+            --template-file $BICEP_FILE `
+            --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" `
+            --action-on-unmanage $AOU `
+            --deny-settings-mode $DSM `
+            --yes `
+            --only-show-errors | Out-Null
 
       - name: Upload Drift Report (single file)
         uses: actions/upload-artifact@v4
