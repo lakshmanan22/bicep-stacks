@@ -62,7 +62,7 @@ jobs:
           $envName = "${{ inputs.environment }}"
 
           # Change these if your RG differs per env
-          $RG  = "rg-Automation"
+          $RG  = "bicep-stacks"
           $LOC = "southcentralus"
 
           # Stack name convention (enterprise-ready)
