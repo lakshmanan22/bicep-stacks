@@ -70,7 +70,7 @@ jobs:
 
           # Your current paths
           $BICEP  = "infra/stacks/storage/main.bicep"
-          $PARAMS = "infra/params/$envName.parameter.json"
+          $PARAMS = "infra/stacks/storage/params/$envName.parameter.json"
 
           "RG=$RG"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "LOC=$LOC"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append
