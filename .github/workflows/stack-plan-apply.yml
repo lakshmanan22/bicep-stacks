@@ -67,11 +67,11 @@ jobs:
           $BICEP  = "infra/stacks/storage/main.bicep"
           $PARAMS = "infra/params/$envName.parameter.json"
 
-          "RG=$RG" | Out-File $env:GITHUB_OUTPUT -Append
-          "LOC=$LOC" | Out-File $env:GITHUB_OUTPUT -Append
-          "STACK_NAME=$STACK" | Out-File $env:GITHUB_OUTPUT -Append
-          "BICEP_FILE=$BICEP" | Out-File $env:GITHUB_OUTPUT -Append
-          "PARAMS_FILE=$PARAMS" | Out-File $env:GITHUB_OUTPUT -Append
+          "RG=$RG"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "LOC=$LOC"            | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "STACK_NAME=$STACK"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "BICEP_FILE=$BICEP"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "PARAMS_FILE=$PARAMS" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Plan (stack-aware drift report, single file)
         shell: pwsh
@@ -79,129 +79,169 @@ jobs:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
           $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
 
-          $RG         = "${{ steps.vars.outputs.RG }}"
-          $LOC        = "${{ steps.vars.outputs.LOC }}"
-          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
-          $BICEP_FILE = "${{ steps.vars.outputs.BICEP_FILE }}"
-          $PARAMS_FILE= "${{ steps.vars.outputs.PARAMS_FILE }}"
-          $AOU        = "${{ inputs.actionOnUnmanage }}"
-          $RUN_ID     = "${{ github.run_id }}"
+          $RG          = "${{ steps.vars.outputs.RG }}"
+          $LOC         = "${{ steps.vars.outputs.LOC }}"
+          $STACK_NAME  = "${{ steps.vars.outputs.STACK_NAME }}"
+          $BICEP_FILE  = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_FILE = "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $AOU         = "${{ inputs.actionOnUnmanage }}"
+          $RUN_ID      = "${{ github.run_id }}"
+          $reportPath  = "drift-report.txt"
 
+          # Ensure RG exists
           az group create -n $RG -l $LOC --only-show-errors | Out-Null
 
-          # What-If
-          $whatIf = az deployment group what-if `
-            --resource-group $RG `
-            --name "whatif-$RUN_ID" `
-            --template-file $BICEP_FILE `
-            --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" `
-            --only-show-errors 2>&1
+          function Invoke-AzSafe {
+            param(
+              [Parameter(Mandatory=$true)][string]$CommandLabel,
+              [Parameter(Mandatory=$true)][scriptblock]$Command
+            )
 
-          $whatIf | Out-File /tmp/whatif.txt -Encoding utf8
+            $out = & {
+              $PSNativeCommandUseErrorActionPreference = $false
+              & $Command 2>&1
+            }
 
-          # Compile template
-          az bicep build --file $BICEP_FILE --outfile /tmp/template.json | Out-Null
+            $code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            [pscustomobject]@{
+              Label    = $CommandLabel
+              ExitCode = $code
+              Output   = ($out | Out-String).TrimEnd()
+            }
+          }
+
+          # 0) Compile Bicep
+          $build = Invoke-AzSafe -CommandLabel "bicep-build" -Command {
+            az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors
+          }
+
+          if ($build.ExitCode -ne 0) {
+            $lines = @(
+              "Terraform-style Drift Report (Deployment Stack)",
+              "==============================================",
+              "Stack Name     : $STACK_NAME",
+              "Resource Group : $RG",
+              "Bicep File     : $BICEP_FILE",
+              "Params File    : $PARAMS_FILE",
+              "Run ID         : $RUN_ID",
+              "",
+              "Plan: ERROR (bicep build failed)",
+              "",
+              "ERROR: Bicep build failed (exit code $($build.ExitCode)).",
+              "",
+              $build.Output
+            )
+            ($lines -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
+            exit 0
+          }
+
           $template = Get-Content /tmp/template.json -Raw | ConvertFrom-Json
 
-          # Load params
-          $params = Get-Content $PARAMS_FILE -Raw | ConvertFrom-Json
-          $paramValues = @{}
-          foreach ($p in $params.parameters.PSObject.Properties) {
-            $paramValues[$p.Name] = $p.Value.value
+          # 1) Validate
+          $validate = Invoke-AzSafe -CommandLabel "deployment-validate" -Command {
+            az deployment group validate --resource-group $RG --template-file $BICEP_FILE --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" --only-show-errors
           }
 
-          # Load stack safely (do not fail if missing)
-          $stackObj = @{}
-          $stackJson = & {
-            $PSNativeCommandUseErrorActionPreference = $false
-            az stack group show -g $RG -n $STACK_NAME -o json --only-show-errors 2>$null
+          # 2) What-If
+          $whatif = Invoke-AzSafe -CommandLabel "deployment-whatif" -Command {
+            az deployment group what-if --resource-group $RG --name "whatif-$RUN_ID" --template-file $BICEP_FILE --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" --only-show-errors
           }
 
-          if ($LASTEXITCODE -eq 0 -and $stackJson) {
-            $stackObj = $stackJson | ConvertFrom-Json
-          }
-          $global:LASTEXITCODE = 0
+          $whatIfText  = $whatif.Output
+          $whatIfLines = $whatIfText -split "`r?`n"
 
-          function Find-SubId($o) {
-            if ($o -match "/subscriptions/([^/]+)/") { return $Matches[1] }
-            foreach ($p in $o.PSObject.Properties) {
-              $r = Find-SubId $p.Value
-              if ($r) { return $r }
-            }
+          if ($whatif.ExitCode -ne 0) {
+            $lines = @(
+              "Terraform-style Drift Report (Deployment Stack)",
+              "==============================================",
+              "Stack Name     : $STACK_NAME",
+              "Resource Group : $RG",
+              "Bicep File     : $BICEP_FILE",
+              "Params File    : $PARAMS_FILE",
+              "Run ID         : $RUN_ID",
+              "",
+              "Plan: ERROR (what-if failed)",
+              "",
+              "Validate exit code: $($validate.ExitCode)",
+              "What-if exit code  : $($whatif.ExitCode)",
+              "",
+              "--- Validate Output ---",
+              $validate.Output,
+              "",
+              "--- What-If Output ---",
+              $whatif.Output
+            )
+            ($lines -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
+            exit 0
           }
 
-          function Collect-Ids($o, [ref]$set) {
-            if ($o -is [string] -and $o -like "/subscriptions/*/providers/*") {
-              $set.Value.Add($o) | Out-Null
-            }
-            foreach ($p in $o.PSObject.Properties) {
-              Collect-Ids $p.Value ([ref]$set.Value)
-            }
-          }
-
-          $lines = Get-Content /tmp/whatif.txt
-          function Blocks($s) {
-            $rx = "^\s{2}\$s\sMicrosoft\."
-            $b=@()
-            for ($i=0;$i -lt $lines.Count;$i++){
-              if ($lines[$i] -match $rx){
-                $blk=@($lines[$i])
-                $j=$i+1
-                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")){
-                  $blk+=$lines[$j];$j++
+          function Get-Blocks($lines, $symbol) {
+            $rx = "^\s{2}\$symbol\sMicrosoft\."
+            $blocks = @()
+            for ($i=0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match $rx) {
+                $blk = @($lines[$i])
+                $j = $i + 1
+                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) {
+                  $blk += $lines[$j]
+                  $j++
                 }
-                $b+=($blk -join "`n");$i=$j-1
+                $blocks += ($blk -join "`n")
+                $i = $j - 1
               }
             }
-            $b
+            return $blocks
           }
 
-          $add = Blocks "+"
-          $mod = Blocks "~"
-          $del = Blocks "-"
+          $addBlocks = Get-Blocks $whatIfLines "+"
+          $modBlocks = Get-Blocks $whatIfLines "~"
+          $delBlocks = Get-Blocks $whatIfLines "-"
 
-          $adds=$add.Count
-          $changes=$mod.Count
-          $deletes=$del.Count
+          $adds    = $addBlocks.Count
+          $changes = $modBlocks.Count
+          $destroys= $delBlocks.Count
 
-          $subId = Find-SubId $stackObj
-          $desired = New-Object System.Collections.Generic.HashSet[string]
-          if ($subId){
-            foreach ($r in $template.resources){
-              if ($r.name -is [string] -and $r.type){
-                $desired.Add("/subscriptions/$subId/resourceGroups/$RG/providers/$($r.type)/$($r.name)") | Out-Null
-              }
-            }
+          $report = New-Object System.Collections.Generic.List[string]
+          $report.Add("Terraform-style Drift Report (Deployment Stack)")
+          $report.Add("==============================================")
+          $report.Add("Stack Name     : $STACK_NAME")
+          $report.Add("Resource Group : $RG")
+          $report.Add("Bicep File     : $BICEP_FILE")
+          $report.Add("Params File    : $PARAMS_FILE")
+          $report.Add("Run ID         : $RUN_ID")
+          $report.Add("")
+          $report.Add("Plan: $adds to add, $changes to change, $destroys to destroy")
+          $report.Add("")
+
+          if ($adds -gt 0) {
+            $report.Add("+ Create")
+            $report.Add("--------")
+            $addBlocks | ForEach-Object { $report.Add($_) }
+            $report.Add("")
           }
 
-          $managed = New-Object System.Collections.Generic.HashSet[string]
-          Collect-Ids $stackObj ([ref]$managed)
-
-          $stackDeletes=@()
-          if ($AOU -ne "detachAll"){
-            $stackDeletes = $managed.Where({ -not $desired.Contains($_) })
+          if ($changes -gt 0) {
+            $report.Add("~ Modify")
+            $report.Add("--------")
+            $modBlocks | ForEach-Object { $report.Add($_) }
+            $report.Add("")
           }
 
-          $destroy = $deletes + $stackDeletes.Count
-
-          $r = New-Object System.Collections.Generic.List[string]
-          $r.Add("Terraform-style Drift Report (Deployment Stack)")
-          $r.Add("==============================================")
-          $r.Add("Stack: $STACK_NAME")
-          $r.Add("Plan: $adds to add, $changes to change, $destroy to destroy")
-          $r.Add("")
-
-          if ($adds){$r.Add("+ Create");$r.AddRange($add);$r.Add("")}
-          if ($changes){$r.Add("~ Modify");$r.AddRange($mod);$r.Add("")}
-          if ($destroy){
-            $r.Add("- Destroy");$r.AddRange($del)
-            foreach ($i in $stackDeletes){$r.Add("- $i")}
+          if ($destroys -gt 0) {
+            $report.Add("- Destroy")
+            $report.Add("---------")
+            $delBlocks | ForEach-Object { $report.Add($_) }
+            $report.Add("")
           }
-          if (-not $adds -and -not $changes -and -not $destroy){$r.Add("No changes detected.")}
 
-          $r -join "`n" | Out-File drift-report.txt -Encoding utf8
+          if ($adds -eq 0 -and $changes -eq 0 -and $destroys -eq 0) {
+            $report.Add("No changes detected.")
+          }
+
+          ($report -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
           exit 0
 
       - name: Apply stack (only when operation=apply)
@@ -212,18 +252,26 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $RG         = "${{ steps.vars.outputs.RG }}"
+          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
+          $BICEP_FILE = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_FILE= "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $AOU        = "${{ inputs.actionOnUnmanage }}"
+          $DSM        = "${{ inputs.denySettingsMode }}"
+
           az stack group create `
-            --name "${{ steps.vars.outputs.STACK_NAME }}" `
-            --resource-group "${{ steps.vars.outputs.RG }}" `
-            --template-file "${{ steps.vars.outputs.BICEP_FILE }}" `
-            --parameters "@$env:GITHUB_WORKSPACE/${{ steps.vars.outputs.PARAMS_FILE }}" `
-            --action-on-unmanage "${{ inputs.actionOnUnmanage }}" `
-            --deny-settings-mode "${{ inputs.denySettingsMode }}" `
+            --name $STACK_NAME `
+            --resource-group $RG `
+            --template-file $BICEP_FILE `
+            --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" `
+            --action-on-unmanage $AOU `
+            --deny-settings-mode $DSM `
             --yes `
             --only-show-errors
 
-      - name: Upload Drift Report
+      - name: Upload Drift Report (single file)
         uses: actions/upload-artifact@v4
         with:
           name: drift-report
           path: drift-report.txt
+          if-no-files-found: error
