@@ -69,7 +69,7 @@ jobs:
           $STACK = "stk-automation-storage-$envName"
 
           # Your current paths
-          $BICEP  = "infra/main.bicep"
+          $BICEP  = "infra/stacks/storage/main.bicep"
           $PARAMS = "infra/params/$envName.parameter.json"
 
           "RG=$RG"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
