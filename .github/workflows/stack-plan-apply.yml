@@ -61,7 +61,7 @@ jobs:
           ENV="${{ inputs.environment }}"
 
           # Adjust these mappings if your test/prod RGs differ
-          RG="rg-Automation"
+          RG="bicep-stacks"
           LOC="southcentralus"
 
           STACK_NAME="stk-automation-storage-${ENV}"
