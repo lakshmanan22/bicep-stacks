@@ -1,0 +1,306 @@
+name: Deployment Stack - Plan/Apply (Terraform-style report)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, test, prod]
+      operation:
+        description: "plan = report only, apply = report + update stack"
+        required: true
+        default: "plan"
+        type: choice
+        options: [plan, apply]
+      actionOnUnmanage:
+        description: "Terraform-like lifecycle: deleteResources recommended"
+        required: true
+        default: "deleteResources"
+        type: choice
+        options: [deleteResources, detachAll, deleteAll]
+      denySettingsMode:
+        description: "Optional guardrail against portal drift"
+        required: true
+        default: "none"
+        type: choice
+        options: [none, denyDelete, denyWriteAndDelete]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Azure CLI + Bicep
+        run: |
+          az version
+          az bicep version || true
+          az bicep upgrade
+          az bicep version
+
+      - name: Resolve stack variables (env mapping)
+        id: vars
+        run: |
+          set -e
+          ENV="${{ inputs.environment }}"
+
+          # Adjust these mappings if your test/prod RGs differ
+          RG="rg-Automation"
+          LOC="southcentralus"
+
+          STACK_NAME="stk-automation-storage-${ENV}"
+
+          # Use your current paths; move to infra/stacks/storage later if you adopt repo structure
+          BICEP_FILE="infra/main.bicep"
+          PARAMS_FILE="infra/params/${ENV}.parameter.json"
+
+          echo "RG=$RG" >> $GITHUB_OUTPUT
+          echo "LOC=$LOC" >> $GITHUB_OUTPUT
+          echo "STACK_NAME=$STACK_NAME" >> $GITHUB_OUTPUT
+          echo "BICEP_FILE=$BICEP_FILE" >> $GITHUB_OUTPUT
+          echo "PARAMS_FILE=$PARAMS_FILE" >> $GITHUB_OUTPUT
+
+      - name: Plan (stack-aware drift report, single file)
+        env:
+          AZURE_CORE_ONLY_SHOW_ERRORS: "true"
+        run: |
+          set -e
+
+          RG="${{ steps.vars.outputs.RG }}"
+          LOC="${{ steps.vars.outputs.LOC }}"
+          STACK_NAME="${{ steps.vars.outputs.STACK_NAME }}"
+          BICEP_FILE="${{ steps.vars.outputs.BICEP_FILE }}"
+          PARAMS_FILE="${{ steps.vars.outputs.PARAMS_FILE }}"
+          AOU="${{ inputs.actionOnUnmanage }}"
+
+          # Ensure RG exists
+          az group create -n "$RG" -l "$LOC" --only-show-errors >/dev/null
+
+          # 1) Run classic what-if (good for create/modify signals)
+          az deployment group what-if \
+            --resource-group "$RG" \
+            --name "whatif-${{ github.run_id }}" \
+            --template-file "$BICEP_FILE" \
+            --parameters @"$GITHUB_WORKSPACE/$PARAMS_FILE" \
+            --only-show-errors \
+            > /tmp/whatif.txt 2>&1
+
+          # 2) Compile bicep -> ARM JSON (so we can list desired resource IDs)
+          az bicep build --file "$BICEP_FILE" --outfile /tmp/template.json
+
+          # 3) Get stack-managed resources (if stack exists)
+          #    If the stack doesn't exist yet, this will fail; we treat it as empty.
+          az stack group show -g "$RG" -n "$STACK_NAME" -o json --only-show-errors > /tmp/stack.json 2>/tmp/stack.err || echo "{}" > /tmp/stack.json
+
+          # 4) Create ONE terraform-like report (adds/changes from what-if + destroys from stack ownership diff)
+          python3 - <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          rg = "${{ steps.vars.outputs.RG }}"
+          stack_name = "${{ steps.vars.outputs.STACK_NAME }}"
+          aou = "${{ inputs.actionOnUnmanage }}"
+          bicep_file = "${{ steps.vars.outputs.BICEP_FILE }}"
+          params_file = "${{ steps.vars.outputs.PARAMS_FILE }}"
+          run_id = "${{ github.run_id }}"
+
+          whatif_txt = Path("/tmp/whatif.txt").read_text(errors="ignore")
+          template = json.loads(Path("/tmp/template.json").read_text(errors="ignore"))
+          try:
+            stack = json.loads(Path("/tmp/stack.json").read_text(errors="ignore"))
+          except Exception:
+            stack = {}
+
+          # ---- Parse create/modify from what-if TEXT (skip legend lines by requiring Microsoft.)
+          add_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  \+ Microsoft\.", l)]
+          mod_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  ~ Microsoft\.", l)]
+          del_lines = [l for l in whatif_txt.splitlines() if re.match(r"^  - Microsoft\.", l)]
+
+          # Extract the full blocks for +/~/- resources (resource line + indented property lines)
+          def blocks(symbol_regex):
+            out = []
+            lines = whatif_txt.splitlines()
+            i = 0
+            while i < len(lines):
+              if re.match(symbol_regex, lines[i]):
+                blk = [lines[i]]
+                i += 1
+                while i < len(lines) and lines[i].startswith("    "):
+                  blk.append(lines[i])
+                  i += 1
+                out.append("\n".join(blk))
+              else:
+                i += 1
+            return out
+
+          add_blocks = blocks(r"^  \+ Microsoft\.")
+          mod_blocks = blocks(r"^  ~ Microsoft\.")
+          del_blocks = blocks(r"^  - Microsoft\.")
+
+          # ---- Build "desired resource IDs" from compiled template (best-effort)
+          # Handles resource name like "[parameters('storageAccountName')]" by reading params file.
+          params = json.loads(Path(params_file).read_text(errors="ignore"))
+          param_values = {k: v.get("value") for k, v in params.get("parameters", {}).items()}
+
+          sub_id = None
+          # We'll infer subscription id from stack show if present, else leave unknown and skip stack diff.
+          # In real runs, stack.json contains resource IDs we can mine.
+          def find_sub_id(obj):
+            if isinstance(obj, dict):
+              for v in obj.values():
+                r = find_sub_id(v)
+                if r: return r
+            elif isinstance(obj, list):
+              for v in obj:
+                r = find_sub_id(v)
+                if r: return r
+            elif isinstance(obj, str) and "/subscriptions/" in obj:
+              m = re.search(r"/subscriptions/([^/]+)/", obj)
+              if m: return m.group(1)
+            return None
+
+          sub_id = find_sub_id(stack) or "UNKNOWN"
+
+          desired_ids = set()
+          for r in template.get("resources", []):
+            rtype = r.get("type")
+            rname = r.get("name")
+            if not rtype or not rname:
+              continue
+
+            # Resolve simple parameter expressions
+            if isinstance(rname, str):
+              m = re.fullmatch(r"\[parameters\('([^']+)'\)\]", rname)
+              if m and m.group(1) in param_values:
+                rname = param_values[m.group(1)]
+
+            # Only accept fully resolved string names
+            if not isinstance(rname, str) or "[" in rname or "]" in rname:
+              continue
+
+            if sub_id != "UNKNOWN":
+              rid = f"/subscriptions/{sub_id}/resourceGroups/{rg}/providers/{rtype}/{rname}"
+              desired_ids.add(rid)
+
+          # ---- Get stack-managed IDs
+          # Quickstart output includes managed resources in the stack show payload. We'll conservatively
+          # collect any strings that look like resource IDs.
+          managed_ids = set()
+
+          def collect_ids(obj):
+            if isinstance(obj, dict):
+              for v in obj.values():
+                collect_ids(v)
+            elif isinstance(obj, list):
+              for v in obj:
+                collect_ids(v)
+            elif isinstance(obj, str) and obj.startswith("/subscriptions/") and "/providers/" in obj:
+              managed_ids.add(obj)
+
+          collect_ids(stack)
+
+          # Stack-aware destroys: resources managed by the stack but not in desired template
+          # Only meaningful when actionOnUnmanage implies deletion.
+          stack_destroy_ids = []
+          if aou in ("deleteResources", "deleteAll") and sub_id != "UNKNOWN" and desired_ids:
+            stack_destroy_ids = sorted(list(managed_ids - desired_ids))
+
+          # Plan counts
+          adds = len(add_lines)
+          changes = len(mod_lines)
+          destroys = len(del_lines) + len(stack_destroy_ids)
+
+          report = []
+          report.append("Terraform-style Drift Report (Deployment Stack)")
+          report.append("==============================================")
+          report.append(f"Stack Name    : {stack_name}")
+          report.append(f"Resource Group: {rg}")
+          report.append(f"Bicep File    : {bicep_file}")
+          report.append(f"Params File   : {params_file}")
+          report.append(f"Run ID        : {run_id}")
+          report.append("")
+          report.append(f"Plan: {adds} to add, {changes} to change, {destroys} to destroy")
+          report.append("")
+
+          if adds:
+            report.append("+ Create")
+            report.append("--------")
+            report.extend(add_blocks)
+            report.append("")
+
+          if changes:
+            report.append("~ Modify")
+            report.append("--------")
+            report.extend(mod_blocks)
+            report.append("")
+
+          if destroys:
+            report.append("- Destroy")
+            report.append("---------")
+            # Deletes directly reported by what-if
+            report.extend(del_blocks)
+
+            # Stack-based deletes (resources removed from template but still managed by stack)
+            if stack_destroy_ids:
+              report.append("")
+              report.append("Stack-managed resources removed from template (will be deleted on apply)")
+              report.append("-----------------------------------------------------------------------")
+              for rid in stack_destroy_ids:
+                report.append(f"- {rid}")
+            report.append("")
+
+          # If none
+          if not (adds or changes or destroys):
+            report.append("No changes detected.")
+
+          Path("drift-report.txt").write_text("\n".join(report))
+          PY
+
+          ls -l drift-report.txt
+
+      - name: Apply stack (only when operation=apply)
+        if: ${{ inputs.operation == 'apply' }}
+        env:
+          AZURE_CORE_ONLY_SHOW_ERRORS: "true"
+        run: |
+          set -e
+          RG="${{ steps.vars.outputs.RG }}"
+          STACK_NAME="${{ steps.vars.outputs.STACK_NAME }}"
+          BICEP_FILE="${{ steps.vars.outputs.BICEP_FILE }}"
+          PARAMS_FILE="${{ steps.vars.outputs.PARAMS_FILE }}"
+
+          # Create or update the stack (Terraform-like lifecycle)
+          # --action-on-unmanage controls delete vs detach behavior
+          # --deny-settings-mode controls guardrails against portal edits
+          az stack group create \
+            --name "$STACK_NAME" \
+            --resource-group "$RG" \
+            --template-file "$BICEP_FILE" \
+            --parameters @"$GITHUB_WORKSPACE/$PARAMS_FILE" \
+            --action-on-unmanage "${{ inputs.actionOnUnmanage }}" \
+            --deny-settings-mode "${{ inputs.denySettingsMode }}" \
+            --yes \
+            --only-show-errors
+
+      - name: Upload Drift Report (single file)
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report
+          path: drift-report.txt
+          if-no-files-found: error
