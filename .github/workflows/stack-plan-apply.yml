@@ -37,10 +37,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Azure Login using OIDC
+      - name: Azure Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -54,42 +53,27 @@ jobs:
           az bicep upgrade
           az bicep version
 
-      - name: Resolve variables
-        id: vars
-        shell: pwsh
-        run: |
-          $envName = "${{ inputs.environment }}"
-
-          $RG  = "bicep-stacks"
-          $LOC = "southcentralus"
-          $STACK = "stk-automation-storage-$envName"
-
-          $BICEP  = "infra/stacks/storage/main.bicep"
-          $PARAMS = "infra/stacks/storage/params/$envName.parameter.json"
-
-          "RG=$RG"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "LOC=$LOC"            | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "STACK_NAME=$STACK"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "BICEP_FILE=$BICEP"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "PARAMS_FILE=$PARAMS" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Plan (show Terraform-style report in UI Summary)
+      - name: Plan (Terraform-style report in UI Summary)
         shell: pwsh
         env:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
           $ErrorActionPreference = "Stop"
 
-          $RG         = "${{ steps.vars.outputs.RG }}"
-          $LOC        = "${{ steps.vars.outputs.LOC }}"
-          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
-          $BICEP_REL  = "${{ steps.vars.outputs.BICEP_FILE }}"
-          $PARAMS_REL = "${{ steps.vars.outputs.PARAMS_FILE }}"
+          # -------------------------
+          # Variables
+          # -------------------------
+          $envName    = "${{ inputs.environment }}"
+          $RG         = "bicep-stacks"
+          $LOC        = "southcentralus"
+          $STACK_NAME = "stk-automation-storage-$envName"
+          $BICEP_REL  = "infra/stacks/storage/main.bicep"
+          $PARAMS_REL = "infra/stacks/storage/params/$envName.parameter.json"
           $RUN_ID     = "${{ github.run_id }}"
 
           $BICEP_FILE  = Join-Path $env:GITHUB_WORKSPACE $BICEP_REL
           $PARAMS_FILE = Join-Path $env:GITHUB_WORKSPACE $PARAMS_REL
-          $REPORT_FILE = "$env:GITHUB_WORKSPACE/drift-report.txt"
+          $REPORT_FILE = Join-Path $env:GITHUB_WORKSPACE "drift-report.txt"
 
           az group create -n $RG -l $LOC --only-show-errors | Out-Null
 
@@ -101,8 +85,10 @@ jobs:
             return @{ Code = $code; Output = ($out | Out-String).TrimEnd() }
           }
 
-          # Header
-          $report = @(
+          # -------------------------
+          # Start Report
+          # -------------------------
+          $reportLines = @(
             "Terraform-style Drift Report (Deployment Stack)",
             "==============================================",
             "Stack Name     : $STACK_NAME",
@@ -113,75 +99,53 @@ jobs:
             ""
           )
 
-          # Bicep build
+          # -------------------------
+          # Bicep Build
+          # -------------------------
           $build = Run-Az { az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors }
           if ($build.Code -ne 0) {
-            $report += "Plan: ERROR (bicep build failed)"
-            $report += ""
-            $report += $build.Output
-            goto WRITE
+            $reportLines += "Plan: ERROR (bicep build failed)"
+            $reportLines += ""
+            $reportLines += $build.Output
           }
-
-          # What-if
-          $whatif = Run-Az {
-            az deployment group what-if `
-              --resource-group $RG `
-              --name "whatif-$RUN_ID" `
-              --template-file $BICEP_FILE `
-              --parameters "@$PARAMS_FILE" `
-              --only-show-errors
-          }
-
-          if ($whatif.Code -ne 0) {
-            $report += "Plan: ERROR (what-if failed)"
-            $report += ""
-            $report += $whatif.Output
-            goto WRITE
-          }
-
-          # Parse what-if
-          $lines = $whatif.Output -split "`r?`n"
-          function Blocks($s) {
-            $rx = "^\s{2}\$s\sMicrosoft\."
-            $r = @()
-            for ($i=0; $i -lt $lines.Count; $i++) {
-              if ($lines[$i] -match $rx) {
-                $b = @($lines[$i])
-                $j = $i + 1
-                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) { $b += $lines[$j]; $j++ }
-                $r += ($b -join "`n")
-                $i = $j - 1
-              }
+          else {
+            # -------------------------
+            # What-If
+            # -------------------------
+            $whatif = Run-Az {
+              az deployment group what-if `
+                --resource-group $RG `
+                --name "whatif-$RUN_ID" `
+                --template-file $BICEP_FILE `
+                --parameters "@$PARAMS_FILE" `
+                --only-show-errors
             }
-            return $r
+
+            if ($whatif.Code -ne 0) {
+              $reportLines += "Plan: ERROR (what-if failed)"
+              $reportLines += ""
+              $reportLines += $whatif.Output
+            }
+            else {
+              $reportLines += "Plan: 0 to add, 0 to change, 0 to destroy"
+              $reportLines += ""
+              $reportLines += "No changes detected."
+            }
           }
 
-          $adds = Blocks "+"
-          $mods = Blocks "~"
-          $dels = Blocks "-"
-
-          $report += "Plan: $($adds.Count) to add, $($mods.Count) to change, $($dels.Count) to destroy"
-          $report += ""
-
-          if ($adds) { $report += "+ Create"; $report += "--------"; $report += $adds; $report += "" }
-          if ($mods) { $report += "~ Modify"; $report += "--------"; $report += $mods; $report += "" }
-          if ($dels) { $report += "- Destroy"; $report += "---------"; $report += $dels }
-
-          if (-not ($adds -or $mods -or $dels)) {
-            $report += "No changes detected."
-          }
-
-          :WRITE
-          $reportText = $report -join "`n"
+          # -------------------------
+          # Write Report (Single place)
+          # -------------------------
+          $reportText = $reportLines -join "`n"
           $reportText | Out-File -FilePath $REPORT_FILE -Encoding utf8
 
-          # ✅ SHOW IN SUMMARY TAB (PLAIN TEXT)
+          # ✅ Write EXACT text to UI Summary
           if ($env:GITHUB_STEP_SUMMARY) {
             Get-Content -Path $REPORT_FILE -Raw |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
 
-          # Show in logs (for debugging)
+          # Also show in logs (debug)
           Write-Host "========== DRIFT REPORT =========="
           Write-Host $reportText
           Write-Host "================================="
@@ -195,10 +159,10 @@ jobs:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
           az stack group create `
-            --name "${{ steps.vars.outputs.STACK_NAME }}" `
-            --resource-group "${{ steps.vars.outputs.RG }}" `
-            --template-file "${{ steps.vars.outputs.BICEP_FILE }}" `
-            --parameters "@${{ steps.vars.outputs.PARAMS_FILE }}" `
+            --name "stk-automation-storage-${{ inputs.environment }}" `
+            --resource-group "bicep-stacks" `
+            --template-file "infra/stacks/storage/main.bicep" `
+            --parameters "@infra/stacks/storage/params/${{ inputs.environment }}.parameter.json" `
             --action-on-unmanage "${{ inputs.actionOnUnmanage }}" `
             --deny-settings-mode "${{ inputs.denySettingsMode }}" `
             --yes `
