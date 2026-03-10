@@ -62,7 +62,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = if (deployNs
           sourcePortRange: '*'
           destinationPortRange: '22'
           sourceAddressPrefix: sshSourceIp
-          destinationAddressPrefix: '*'
+          destinationAddressPrefix: '10.0.0.0/16'
         }
       }
     ]
