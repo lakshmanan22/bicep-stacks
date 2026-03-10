@@ -83,49 +83,48 @@ jobs:
           $RG          = "${{ steps.vars.outputs.RG }}"
           $LOC         = "${{ steps.vars.outputs.LOC }}"
           $STACK_NAME  = "${{ steps.vars.outputs.STACK_NAME }}"
-          $BICEP_FILE  = "${{ steps.vars.outputs.BICEP_FILE }}"
-          $PARAMS_FILE = "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $BICEP_REL   = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_REL  = "${{ steps.vars.outputs.PARAMS_FILE }}"
           $AOU         = "${{ inputs.actionOnUnmanage }}"
           $RUN_ID      = "${{ github.run_id }}"
           $reportPath  = "drift-report.txt"
 
-          # Ensure RG exists
+          $BICEP_FILE  = Join-Path $env:GITHUB_WORKSPACE $BICEP_REL
+          $PARAMS_FILE = Join-Path $env:GITHUB_WORKSPACE $PARAMS_REL
+
           az group create -n $RG -l $LOC --only-show-errors | Out-Null
 
           function Invoke-AzSafe {
             param(
-              [Parameter(Mandatory=$true)][string]$CommandLabel,
+              [Parameter(Mandatory=$true)][string]$Label,
               [Parameter(Mandatory=$true)][scriptblock]$Command
             )
-
             $out = & {
               $PSNativeCommandUseErrorActionPreference = $false
               & $Command 2>&1
             }
-
             $code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
-
             [pscustomobject]@{
-              Label    = $CommandLabel
+              Label    = $Label
               ExitCode = $code
               Output   = ($out | Out-String).TrimEnd()
             }
           }
 
-          # 0) Compile Bicep
-          $build = Invoke-AzSafe -CommandLabel "bicep-build" -Command {
+          # 0) Compile Bicep -> template.json
+          $build = Invoke-AzSafe -Label "bicep-build" -Command {
             az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors
           }
 
           if ($build.ExitCode -ne 0) {
-            $lines = @(
+            @(
               "Terraform-style Drift Report (Deployment Stack)",
               "==============================================",
               "Stack Name     : $STACK_NAME",
               "Resource Group : $RG",
-              "Bicep File     : $BICEP_FILE",
-              "Params File    : $PARAMS_FILE",
+              "Bicep File     : $BICEP_REL",
+              "Params File    : $PARAMS_REL",
               "Run ID         : $RUN_ID",
               "",
               "Plan: ERROR (bicep build failed)",
@@ -133,50 +132,40 @@ jobs:
               "ERROR: Bicep build failed (exit code $($build.ExitCode)).",
               "",
               $build.Output
-            )
-            ($lines -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
+            ) -join "`n" | Out-File -FilePath $reportPath -Encoding utf8
             exit 0
           }
 
           $template = Get-Content /tmp/template.json -Raw | ConvertFrom-Json
 
-          # 1) Validate
-          $validate = Invoke-AzSafe -CommandLabel "deployment-validate" -Command {
-            az deployment group validate --resource-group $RG --template-file $BICEP_FILE --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" --only-show-errors
+          # 1) What-If (for create/modify visibility)
+          $whatif = Invoke-AzSafe -Label "deployment-whatif" -Command {
+            az deployment group what-if `
+              --resource-group $RG `
+              --name "whatif-$RUN_ID" `
+              --template-file $BICEP_FILE `
+              --parameters "@$PARAMS_FILE" `
+              --only-show-errors
           }
-
-          # 2) What-If
-          $whatif = Invoke-AzSafe -CommandLabel "deployment-whatif" -Command {
-            az deployment group what-if --resource-group $RG --name "whatif-$RUN_ID" --template-file $BICEP_FILE --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" --only-show-errors
-          }
-
-          $whatIfText  = $whatif.Output
-          $whatIfLines = $whatIfText -split "`r?`n"
 
           if ($whatif.ExitCode -ne 0) {
-            $lines = @(
+            @(
               "Terraform-style Drift Report (Deployment Stack)",
               "==============================================",
               "Stack Name     : $STACK_NAME",
               "Resource Group : $RG",
-              "Bicep File     : $BICEP_FILE",
-              "Params File    : $PARAMS_FILE",
+              "Bicep File     : $BICEP_REL",
+              "Params File    : $PARAMS_REL",
               "Run ID         : $RUN_ID",
               "",
               "Plan: ERROR (what-if failed)",
               "",
-              "Validate exit code: $($validate.ExitCode)",
-              "What-if exit code  : $($whatif.ExitCode)",
-              "",
-              "--- Validate Output ---",
-              $validate.Output,
-              "",
-              "--- What-If Output ---",
               $whatif.Output
-            )
-            ($lines -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
+            ) -join "`n" | Out-File -FilePath $reportPath -Encoding utf8
             exit 0
           }
+
+          $whatIfLines = $whatif.Output -split "`r?`n"
 
           function Get-Blocks($lines, $symbol) {
             $rx = "^\s{2}\$symbol\sMicrosoft\."
@@ -185,10 +174,7 @@ jobs:
               if ($lines[$i] -match $rx) {
                 $blk = @($lines[$i])
                 $j = $i + 1
-                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) {
-                  $blk += $lines[$j]
-                  $j++
-                }
+                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) { $blk += $lines[$j]; $j++ }
                 $blocks += ($blk -join "`n")
                 $i = $j - 1
               }
@@ -200,41 +186,74 @@ jobs:
           $modBlocks = Get-Blocks $whatIfLines "~"
           $delBlocks = Get-Blocks $whatIfLines "-"
 
-          $adds    = $addBlocks.Count
-          $changes = $modBlocks.Count
-          $destroys= $delBlocks.Count
+          # 2) Stack-managed IDs (this is what enables delete when template is empty)
+          $managed = Invoke-AzSafe -Label "stack-managed-ids" -Command {
+            az stack group show -g $RG -n $STACK_NAME --query "resources[].id" -o tsv --only-show-errors
+          }
+
+          $managedIds = New-Object System.Collections.Generic.HashSet[string]
+          if ($managed.ExitCode -eq 0 -and $managed.Output) {
+            foreach ($id in ($managed.Output -split "`r?`n")) {
+              $t = $id.Trim()
+              if ($t) { [void]$managedIds.Add($t) }
+            }
+          }
+
+          # 3) Desired IDs from template (best-effort: only resolved names)
+          $subId = az account show --query id -o tsv
+          $desiredIds = New-Object System.Collections.Generic.HashSet[string]
+
+          foreach ($r in $template.resources) {
+            $rtype = $r.type
+            $rname = $r.name
+            if (-not $rtype -or -not $rname) { continue }
+
+            # Skip unresolved expressions (safe)
+            if ($rname -isnot [string]) { continue }
+            if ($rname.Contains("[") -or $rname.Contains("]")) { continue }
+
+            [void]$desiredIds.Add("/subscriptions/$subId/resourceGroups/$RG/providers/$rtype/$rname")
+          }
+
+          # ✅ IMPORTANT FIX:
+          # If template is empty, desiredIds.Count = 0.
+          # With deleteResources/deleteAll, that means "delete all stack-managed resources".
+          $stackDestroyIds = @()
+          if (($AOU -eq "deleteResources" -or $AOU -eq "deleteAll") -and $managedIds.Count -gt 0) {
+            $stackDestroyIds = $managedIds.Where({ -not $desiredIds.Contains($_) }) | Sort-Object
+          }
+
+          $adds     = $addBlocks.Count
+          $changes  = $modBlocks.Count
+          $destroys = $delBlocks.Count + $stackDestroyIds.Count
 
           $report = New-Object System.Collections.Generic.List[string]
           $report.Add("Terraform-style Drift Report (Deployment Stack)")
           $report.Add("==============================================")
           $report.Add("Stack Name     : $STACK_NAME")
           $report.Add("Resource Group : $RG")
-          $report.Add("Bicep File     : $BICEP_FILE")
-          $report.Add("Params File    : $PARAMS_FILE")
+          $report.Add("Bicep File     : $BICEP_REL")
+          $report.Add("Params File    : $PARAMS_REL")
           $report.Add("Run ID         : $RUN_ID")
           $report.Add("")
           $report.Add("Plan: $adds to add, $changes to change, $destroys to destroy")
           $report.Add("")
 
-          if ($adds -gt 0) {
-            $report.Add("+ Create")
-            $report.Add("--------")
-            $addBlocks | ForEach-Object { $report.Add($_) }
-            $report.Add("")
-          }
-
-          if ($changes -gt 0) {
-            $report.Add("~ Modify")
-            $report.Add("--------")
-            $modBlocks | ForEach-Object { $report.Add($_) }
-            $report.Add("")
-          }
+          if ($adds -gt 0) { $report.Add("+ Create"); $report.Add("--------"); $addBlocks | % { $report.Add($_) }; $report.Add("") }
+          if ($changes -gt 0) { $report.Add("~ Modify"); $report.Add("--------"); $modBlocks | % { $report.Add($_) }; $report.Add("") }
 
           if ($destroys -gt 0) {
             $report.Add("- Destroy")
             $report.Add("---------")
-            $delBlocks | ForEach-Object { $report.Add($_) }
-            $report.Add("")
+            $delBlocks | % { $report.Add($_) }
+
+            if ($stackDestroyIds.Count -gt 0) {
+              $report.Add("")
+              $report.Add("Stack-managed resources removed from template (will be deleted on apply)")
+              $report.Add("-----------------------------------------------------------------------")
+              $stackDestroyIds | % { $report.Add("- $_") }
+              $report.Add("")
+            }
           }
 
           if ($adds -eq 0 -and $changes -eq 0 -and $destroys -eq 0) {
@@ -242,6 +261,7 @@ jobs:
           }
 
           ($report -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
+          $global:LASTEXITCODE = 0
           exit 0
 
       - name: Apply stack (only when operation=apply)
@@ -254,16 +274,19 @@ jobs:
 
           $RG         = "${{ steps.vars.outputs.RG }}"
           $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
-          $BICEP_FILE = "${{ steps.vars.outputs.BICEP_FILE }}"
-          $PARAMS_FILE= "${{ steps.vars.outputs.PARAMS_FILE }}"
+          $BICEP_REL  = "${{ steps.vars.outputs.BICEP_FILE }}"
+          $PARAMS_REL = "${{ steps.vars.outputs.PARAMS_FILE }}"
           $AOU        = "${{ inputs.actionOnUnmanage }}"
           $DSM        = "${{ inputs.denySettingsMode }}"
+
+          $BICEP_FILE  = Join-Path $env:GITHUB_WORKSPACE $BICEP_REL
+          $PARAMS_FILE = Join-Path $env:GITHUB_WORKSPACE $PARAMS_REL
 
           az stack group create `
             --name $STACK_NAME `
             --resource-group $RG `
             --template-file $BICEP_FILE `
-            --parameters "@$env:GITHUB_WORKSPACE/$PARAMS_FILE" `
+            --parameters "@$PARAMS_FILE" `
             --action-on-unmanage $AOU `
             --deny-settings-mode $DSM `
             --yes `
