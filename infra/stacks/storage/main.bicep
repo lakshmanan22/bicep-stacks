@@ -13,11 +13,11 @@ param sshSourceIp string = '10.0.0.0/24'
 @description('Resource tags')
 param tags object = {}
 
-//@description('Toggle storage account deployment')
-//param deployStorage bool = true
+@description('Toggle storage account deployment')
+param deployStorage bool = true
 
-//@description('Toggle NSG deployment')
-//param deployNsg bool = true
+@description('Toggle NSG deployment')
+param deployNsg bool = true
 
 // ==============================
 // Storage Account
