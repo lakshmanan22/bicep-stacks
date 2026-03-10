@@ -6,13 +6,19 @@
       "value": "southcentralus"
     },
     "storageAccountName": {
-      "value": "devstg2206-stack"
+      "value": "devstg2206"
     },
     "nsgName": {
-      "value": "nsg-dev-app-stack"
+      "value": "nsg-dev-app"
     },
     "sshSourceIp": {
       "value": "10.0.0.0/24"
+    },
+    "deployStorage": {
+      "value": true
+    },
+    "deployNsg": {
+      "value": true
     },
     "tags": {
       "value": {
