@@ -7,22 +7,16 @@ param storageAccountName string
 @description('Network Security Group name')
 param nsgName string
 
-@description('Source IP/CIDR allowed for SSH (example drift test input)')
-param sshSourceIp string = '10.0.0.0/24'
+@description('Source IP/CIDR allowed for SSH')
+param sshSourceIp string
 
 @description('Resource tags')
 param tags object = {}
 
-@description('Toggle storage account deployment')
-param deployStorage bool = true
-
-@description('Toggle NSG deployment')
-param deployNsg bool = true
-
 // ==============================
 // Storage Account
 // ==============================
-resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = if (deployStorage) {
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
   tags: tags
@@ -46,7 +40,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = if (dep
 // ==============================
 // Network Security Group + Rule
 // ==============================
-resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = if (deployNsg) {
+resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
   name: nsgName
   location: location
   tags: tags
@@ -62,7 +56,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = if (deployNs
           sourcePortRange: '*'
           destinationPortRange: '22'
           sourceAddressPrefix: sshSourceIp
-          destinationAddressPrefix: '10.0.0.0/16'
+          destinationAddressPrefix: '10.0.0.0/16' // ✅ policy compliant
         }
       }
     ]
@@ -70,8 +64,8 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = if (deployNs
 }
 
 // ==============================
-// Outputs (safe with toggles)
+// Outputs
 // ==============================
-output storageAccountId string = deployStorage ? storageAccount.id : ''
-output storageAccountNameOut string = deployStorage ? storageAccount.name : ''
-output nsgId string = deployNsg ? nsg.id : ''
+output storageAccountId string = storageAccount.id
+output storageAccountName string = storageAccount.name
+output nsgId string = nsg.id
