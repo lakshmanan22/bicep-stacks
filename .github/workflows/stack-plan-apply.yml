@@ -221,4 +221,3 @@ jobs:
             --deny-settings-mode "${{ inputs.denySettingsMode }}" `
             --yes `
             --only-show-errors
-``
