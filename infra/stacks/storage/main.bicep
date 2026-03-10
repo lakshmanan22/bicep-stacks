@@ -1,3 +1,4 @@
+/*
 @description('Location for all resources')
 param location string
 
@@ -27,6 +28,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
       bypass: 'AzureServices'
     }
   }
+*/
 }
 
 output storageAccountId string = storageAccount.id
