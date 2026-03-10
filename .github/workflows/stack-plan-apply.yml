@@ -73,7 +73,7 @@ jobs:
           "BICEP_FILE=$BICEP"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "PARAMS_FILE=$PARAMS" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Plan (stack-aware drift report, single file)
+      - name: Plan (Terraform-style drift report)
         shell: pwsh
         env:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
@@ -87,7 +87,6 @@ jobs:
           $PARAMS_REL  = "${{ steps.vars.outputs.PARAMS_FILE }}"
           $AOU         = "${{ inputs.actionOnUnmanage }}"
           $RUN_ID      = "${{ github.run_id }}"
-          $reportPath  = "drift-report.txt"
 
           $BICEP_FILE  = Join-Path $env:GITHUB_WORKSPACE $BICEP_REL
           $PARAMS_FILE = Join-Path $env:GITHUB_WORKSPACE $PARAMS_REL
@@ -95,30 +94,17 @@ jobs:
           az group create -n $RG -l $LOC --only-show-errors | Out-Null
 
           function Invoke-AzSafe {
-            param(
-              [Parameter(Mandatory=$true)][string]$Label,
-              [Parameter(Mandatory=$true)][scriptblock]$Command
-            )
-            $out = & {
-              $PSNativeCommandUseErrorActionPreference = $false
-              & $Command 2>&1
-            }
+            param([scriptblock]$Command)
+            $out = & { & $Command 2>&1 }
             $code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
-            [pscustomobject]@{
-              Label    = $Label
-              ExitCode = $code
-              Output   = ($out | Out-String).TrimEnd()
-            }
+            return @{ Code = $code; Output = ($out | Out-String).TrimEnd() }
           }
 
-          # 0) Compile Bicep -> template.json
-          $build = Invoke-AzSafe -Label "bicep-build" -Command {
-            az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors
-          }
-
-          if ($build.ExitCode -ne 0) {
-            @(
+          # Build Bicep
+          $build = Invoke-AzSafe { az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors }
+          if ($build.Code -ne 0) {
+            $report = @(
               "Terraform-style Drift Report (Deployment Stack)",
               "==============================================",
               "Stack Name     : $STACK_NAME",
@@ -129,17 +115,15 @@ jobs:
               "",
               "Plan: ERROR (bicep build failed)",
               "",
-              "ERROR: Bicep build failed (exit code $($build.ExitCode)).",
-              "",
               $build.Output
-            ) -join "`n" | Out-File -FilePath $reportPath -Encoding utf8
-            exit 0
+            ) -join "`n"
+            goto WRITE_SUMMARY
           }
 
           $template = Get-Content /tmp/template.json -Raw | ConvertFrom-Json
 
-          # 1) What-If (for create/modify visibility)
-          $whatif = Invoke-AzSafe -Label "deployment-whatif" -Command {
+          # What-if
+          $whatif = Invoke-AzSafe {
             az deployment group what-if `
               --resource-group $RG `
               --name "whatif-$RUN_ID" `
@@ -148,120 +132,78 @@ jobs:
               --only-show-errors
           }
 
-          if ($whatif.ExitCode -ne 0) {
-            @(
-              "Terraform-style Drift Report (Deployment Stack)",
-              "==============================================",
-              "Stack Name     : $STACK_NAME",
-              "Resource Group : $RG",
-              "Bicep File     : $BICEP_REL",
-              "Params File    : $PARAMS_REL",
-              "Run ID         : $RUN_ID",
-              "",
-              "Plan: ERROR (what-if failed)",
-              "",
-              $whatif.Output
-            ) -join "`n" | Out-File -FilePath $reportPath -Encoding utf8
-            exit 0
+          if ($whatif.Code -ne 0) {
+            $report = "What-if failed:`n$($whatif.Output)"
+            goto WRITE_SUMMARY
           }
 
-          $whatIfLines = $whatif.Output -split "`r?`n"
-
-          function Get-Blocks($lines, $symbol) {
-            $rx = "^\s{2}\$symbol\sMicrosoft\."
-            $blocks = @()
+          $lines = $whatif.Output -split "`r?`n"
+          function Blocks($s) {
+            $rx = "^\s{2}\$s\sMicrosoft\."
+            $r = @()
             for ($i=0; $i -lt $lines.Count; $i++) {
               if ($lines[$i] -match $rx) {
-                $blk = @($lines[$i])
+                $b = @($lines[$i])
                 $j = $i + 1
-                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) { $blk += $lines[$j]; $j++ }
-                $blocks += ($blk -join "`n")
+                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) { $b += $lines[$j]; $j++ }
+                $r += ($b -join "`n")
                 $i = $j - 1
               }
             }
-            return $blocks
+            return $r
           }
 
-          $addBlocks = Get-Blocks $whatIfLines "+"
-          $modBlocks = Get-Blocks $whatIfLines "~"
-          $delBlocks = Get-Blocks $whatIfLines "-"
+          $adds = Blocks "+"
+          $mods = Blocks "~"
+          $dels = Blocks "-"
 
-          # 2) Stack-managed IDs (this is what enables delete when template is empty)
-          $managed = Invoke-AzSafe -Label "stack-managed-ids" -Command {
-            az stack group show -g $RG -n $STACK_NAME --query "resources[].id" -o tsv --only-show-errors
+          # Stack-managed delete detection
+          $managed = Invoke-AzSafe { az stack group show -g $RG -n $STACK_NAME --query "resources[].id" -o tsv --only-show-errors }
+          $managedIds = @($managed.Output -split "`n" | Where-Object { $_ })
+
+          $report = @(
+            "Terraform-style Drift Report (Deployment Stack)",
+            "==============================================",
+            "Stack Name     : $STACK_NAME",
+            "Resource Group : $RG",
+            "Bicep File     : $BICEP_REL",
+            "Params File    : $PARAMS_REL",
+            "Run ID         : $RUN_ID",
+            "",
+            "Plan: $($adds.Count) to add, $($mods.Count) to change, $($dels.Count + $managedIds.Count) to destroy",
+            ""
+          )
+
+          if ($adds) { $report += "+ Create"; $report += "--------"; $report += $adds; $report += "" }
+          if ($mods) { $report += "~ Modify"; $report += "--------"; $report += $mods; $report += "" }
+          if ($managedIds) {
+            $report += "- Destroy"
+            $report += "---------"
+            $managedIds | ForEach-Object { $report += "- $_" }
           }
 
-          $managedIds = New-Object System.Collections.Generic.HashSet[string]
-          if ($managed.ExitCode -eq 0 -and $managed.Output) {
-            foreach ($id in ($managed.Output -split "`r?`n")) {
-              $t = $id.Trim()
-              if ($t) { [void]$managedIds.Add($t) }
-            }
+          if (-not ($adds -or $mods -or $managedIds)) {
+            $report += "No changes detected."
           }
 
-          # 3) Desired IDs from template (best-effort: only resolved names)
-          $subId = az account show --query id -o tsv
-          $desiredIds = New-Object System.Collections.Generic.HashSet[string]
+          $report = $report -join "`n"
 
-          foreach ($r in $template.resources) {
-            $rtype = $r.type
-            $rname = $r.name
-            if (-not $rtype -or -not $rname) { continue }
+          :WRITE_SUMMARY
+          Write-Host "========== DRIFT REPORT =========="
+          Write-Host $report
+          Write-Host "================================="
 
-            # Skip unresolved expressions (safe)
-            if ($rname -isnot [string]) { continue }
-            if ($rname.Contains("[") -or $rname.Contains("]")) { continue }
-
-            [void]$desiredIds.Add("/subscriptions/$subId/resourceGroups/$RG/providers/$rtype/$rname")
+          if ($env:GITHUB_STEP_SUMMARY) {
+            @(
+              "## Terraform-style Drift Report",
+              "",
+              "```text",
+              $report,
+              "```"
+            ) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
 
-          # ✅ IMPORTANT FIX:
-          # If template is empty, desiredIds.Count = 0.
-          # With deleteResources/deleteAll, that means "delete all stack-managed resources".
-          $stackDestroyIds = @()
-          if (($AOU -eq "deleteResources" -or $AOU -eq "deleteAll") -and $managedIds.Count -gt 0) {
-            $stackDestroyIds = $managedIds.Where({ -not $desiredIds.Contains($_) }) | Sort-Object
-          }
-
-          $adds     = $addBlocks.Count
-          $changes  = $modBlocks.Count
-          $destroys = $delBlocks.Count + $stackDestroyIds.Count
-
-          $report = New-Object System.Collections.Generic.List[string]
-          $report.Add("Terraform-style Drift Report (Deployment Stack)")
-          $report.Add("==============================================")
-          $report.Add("Stack Name     : $STACK_NAME")
-          $report.Add("Resource Group : $RG")
-          $report.Add("Bicep File     : $BICEP_REL")
-          $report.Add("Params File    : $PARAMS_REL")
-          $report.Add("Run ID         : $RUN_ID")
-          $report.Add("")
-          $report.Add("Plan: $adds to add, $changes to change, $destroys to destroy")
-          $report.Add("")
-
-          if ($adds -gt 0) { $report.Add("+ Create"); $report.Add("--------"); $addBlocks | % { $report.Add($_) }; $report.Add("") }
-          if ($changes -gt 0) { $report.Add("~ Modify"); $report.Add("--------"); $modBlocks | % { $report.Add($_) }; $report.Add("") }
-
-          if ($destroys -gt 0) {
-            $report.Add("- Destroy")
-            $report.Add("---------")
-            $delBlocks | % { $report.Add($_) }
-
-            if ($stackDestroyIds.Count -gt 0) {
-              $report.Add("")
-              $report.Add("Stack-managed resources removed from template (will be deleted on apply)")
-              $report.Add("-----------------------------------------------------------------------")
-              $stackDestroyIds | % { $report.Add("- $_") }
-              $report.Add("")
-            }
-          }
-
-          if ($adds -eq 0 -and $changes -eq 0 -and $destroys -eq 0) {
-            $report.Add("No changes detected.")
-          }
-
-          ($report -join "`n") | Out-File -FilePath $reportPath -Encoding utf8
-          $global:LASTEXITCODE = 0
+          Write-Host "::notice title=Drift Report::See the Summary tab for the Terraform-style drift report."
           exit 0
 
       - name: Apply stack (only when operation=apply)
@@ -270,31 +212,13 @@ jobs:
         env:
           AZURE_CORE_ONLY_SHOW_ERRORS: "true"
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $RG         = "${{ steps.vars.outputs.RG }}"
-          $STACK_NAME = "${{ steps.vars.outputs.STACK_NAME }}"
-          $BICEP_REL  = "${{ steps.vars.outputs.BICEP_FILE }}"
-          $PARAMS_REL = "${{ steps.vars.outputs.PARAMS_FILE }}"
-          $AOU        = "${{ inputs.actionOnUnmanage }}"
-          $DSM        = "${{ inputs.denySettingsMode }}"
-
-          $BICEP_FILE  = Join-Path $env:GITHUB_WORKSPACE $BICEP_REL
-          $PARAMS_FILE = Join-Path $env:GITHUB_WORKSPACE $PARAMS_REL
-
           az stack group create `
-            --name $STACK_NAME `
-            --resource-group $RG `
-            --template-file $BICEP_FILE `
-            --parameters "@$PARAMS_FILE" `
-            --action-on-unmanage $AOU `
-            --deny-settings-mode $DSM `
+            --name "${{ steps.vars.outputs.STACK_NAME }}" `
+            --resource-group "${{ steps.vars.outputs.RG }}" `
+            --template-file "${{ steps.vars.outputs.BICEP_FILE }}" `
+            --parameters "@${{ steps.vars.outputs.PARAMS_FILE }}" `
+            --action-on-unmanage "${{ inputs.actionOnUnmanage }}" `
+            --deny-settings-mode "${{ inputs.denySettingsMode }}" `
             --yes `
             --only-show-errors
-
-      - name: Upload Drift Report (single file)
-        uses: actions/upload-artifact@v4
-        with:
-          name: drift-report
-          path: drift-report.txt
-          if-no-files-found: error
+``
