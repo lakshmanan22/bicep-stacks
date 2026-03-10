@@ -1,4 +1,3 @@
-/*
 @description('Location for all resources')
 param location string
 
@@ -8,6 +7,7 @@ param storageAccountName string
 @description('Resource tags')
 param tags object = {}
 
+/*
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
@@ -28,8 +28,8 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
       bypass: 'AzureServices'
     }
   }
-*/
 }
 
 output storageAccountId string = storageAccount.id
 output storageAccountName string = storageAccount.name
+*/
