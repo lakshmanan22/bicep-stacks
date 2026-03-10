@@ -6,7 +6,7 @@
       "value": "southcentralus"
     },
     "storageAccountName": {
-      "value": "devstg2206-stk"
+      "value": "devstg2206stk"
     },
     "nsgName": {
       "value": "nsg-dev-app-stk"
