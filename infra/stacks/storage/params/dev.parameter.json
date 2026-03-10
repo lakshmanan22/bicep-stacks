@@ -14,12 +14,6 @@
     "sshSourceIp": {
       "value": "10.0.0.0/24"
     },
-    "deployStorage": {
-      "value": true
-    },
-    "deployNsg": {
-      "value": true
-    },
     "tags": {
       "value": {
         "environment": "dev",
