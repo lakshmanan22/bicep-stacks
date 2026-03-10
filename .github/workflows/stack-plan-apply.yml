@@ -86,68 +86,116 @@ jobs:
           }
 
           # -------------------------
-          # Start Report
+          # Start report
           # -------------------------
-          $reportLines = @(
-            "Terraform-style Drift Report (Deployment Stack)",
-            "==============================================",
-            "Stack Name     : $STACK_NAME",
-            "Resource Group : $RG",
-            "Bicep File     : $BICEP_REL",
-            "Params File    : $PARAMS_REL",
-            "Run ID         : $RUN_ID",
-            ""
-          )
+          $report = New-Object System.Collections.Generic.List[string]
+          $report.Add("Terraform-style Drift Report (Deployment Stack)")
+          $report.Add("==============================================")
+          $report.Add("Stack Name     : $STACK_NAME")
+          $report.Add("Resource Group : $RG")
+          $report.Add("Bicep File     : $BICEP_REL")
+          $report.Add("Params File    : $PARAMS_REL")
+          $report.Add("Run ID         : $RUN_ID")
+          $report.Add("")
 
           # -------------------------
-          # Bicep Build
+          # Bicep build
           # -------------------------
           $build = Run-Az { az bicep build --file $BICEP_FILE --outfile /tmp/template.json --only-show-errors }
           if ($build.Code -ne 0) {
-            $reportLines += "Plan: ERROR (bicep build failed)"
-            $reportLines += ""
-            $reportLines += $build.Output
-          }
-          else {
-            # -------------------------
-            # What-If
-            # -------------------------
-            $whatif = Run-Az {
-              az deployment group what-if `
-                --resource-group $RG `
-                --name "whatif-$RUN_ID" `
-                --template-file $BICEP_FILE `
-                --parameters "@$PARAMS_FILE" `
-                --only-show-errors
-            }
-
-            if ($whatif.Code -ne 0) {
-              $reportLines += "Plan: ERROR (what-if failed)"
-              $reportLines += ""
-              $reportLines += $whatif.Output
-            }
-            else {
-              $reportLines += "Plan: 0 to add, 0 to change, 0 to destroy"
-              $reportLines += ""
-              $reportLines += "No changes detected."
-            }
+            $report.Add("Plan: ERROR (bicep build failed)")
+            $report.Add("")
+            $report.Add($build.Output)
+            goto WRITE
           }
 
           # -------------------------
-          # Write Report (Single place)
+          # What-If
           # -------------------------
-          $reportText = $reportLines -join "`n"
-          $reportText | Out-File -FilePath $REPORT_FILE -Encoding utf8
+          $whatif = Run-Az {
+            az deployment group what-if `
+              --resource-group $RG `
+              --name "whatif-$RUN_ID" `
+              --template-file $BICEP_FILE `
+              --parameters "@$PARAMS_FILE" `
+              --only-show-errors
+          }
 
-          # ✅ Write EXACT text to UI Summary
+          if ($whatif.Code -ne 0) {
+            $report.Add("Plan: ERROR (what-if failed)")
+            $report.Add("")
+            $report.Add($whatif.Output)
+            goto WRITE
+          }
+
+          # -------------------------
+          # Parse What-If output
+          # -------------------------
+          $lines = $whatif.Output -split "`r?`n"
+
+          function Get-Blocks($symbol) {
+            $rx = "^\s{2}\$symbol\sMicrosoft\."
+            $blocks = @()
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match $rx) {
+                $blk = @($lines[$i])
+                $j = $i + 1
+                while ($j -lt $lines.Count -and $lines[$j].StartsWith("    ")) {
+                  $blk += $lines[$j]
+                  $j++
+                }
+                $blocks += ($blk -join "`n")
+                $i = $j - 1
+              }
+            }
+            return $blocks
+          }
+
+          $adds = Get-Blocks "+"
+          $mods = Get-Blocks "~"
+          $dels = Get-Blocks "-"
+
+          $report.Add("Plan: $($adds.Count) to add, $($mods.Count) to change, $($dels.Count) to destroy")
+          $report.Add("")
+
+          if ($adds.Count -gt 0) {
+            $report.Add("+ Create")
+            $report.Add("--------")
+            $adds | ForEach-Object { $report.Add($_) }
+            $report.Add("")
+          }
+
+          if ($mods.Count -gt 0) {
+            $report.Add("~ Modify")
+            $report.Add("--------")
+            $mods | ForEach-Object { $report.Add($_) }
+            $report.Add("")
+          }
+
+          if ($dels.Count -gt 0) {
+            $report.Add("- Destroy")
+            $report.Add("---------")
+            $dels | ForEach-Object { $report.Add($_) }
+            $report.Add("")
+          }
+
+          if ($adds.Count -eq 0 -and $mods.Count -eq 0 -and $dels.Count -eq 0) {
+            $report.Add("No changes detected.")
+          }
+
+          :WRITE
+          $final = $report -join "`n"
+          $final | Out-File -FilePath $REPORT_FILE -Encoding utf8
+
+          # ✅ Write EXACT plain text to UI Summary
           if ($env:GITHUB_STEP_SUMMARY) {
             Get-Content -Path $REPORT_FILE -Raw |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
 
-          # Also show in logs (debug)
+          # Debug in logs
           Write-Host "========== DRIFT REPORT =========="
-          Write-Host $reportText
+          Write-Host $final
           Write-Host "================================="
 
           exit 0
