@@ -6,10 +6,10 @@
       "value": "southcentralus"
     },
     "storageAccountName": {
-      "value": "devstg2206"
+      "value": "devstg2206-stk"
     },
     "nsgName": {
-      "value": "nsg-dev-app"
+      "value": "nsg-dev-app-stk"
     },
     "sshSourceIp": {
       "value": "10.0.0.0/24"
